@@ -20,7 +20,7 @@ export function getConfiguredPassword(): string {
  * Indicates whether the app is currently using the fallback default password.
  */
 export function isUsingDefaultPassword(): boolean {
-  return !process.env.APP_PASSWORD && !process.env.UPLOAD_PASSWORD;
+  return getConfiguredPassword() === 'vault2026';
 }
 
 function getSigningSecret(): string {
