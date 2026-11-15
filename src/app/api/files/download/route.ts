@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
-import { getStoredFileContent } from '@/lib/storage';
+import { getDirectBlobDownloadUrl, getStoredFileContent } from '@/lib/storage';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 export async function GET(request: Request) {
   if (!(await isAuthenticated())) {
@@ -15,12 +16,28 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const id = url.searchParams.get('id');
   const inline = url.searchParams.get('inline') === '1';
+  const proxy = url.searchParams.get('proxy') === '1';
 
   if (!id) {
     return NextResponse.json(
       { error: 'Missing file identifier.' },
       { status: 400 }
     );
+  }
+
+  // For Vercel Blob files (unless proxy=1 is requested for small text/code fetch previews),
+  // redirect authenticated users directly to the Vercel Blob Edge CDN URL so 500MB+ files
+  // download and stream at full CDN speed with HTTP Range support and zero serverless limits.
+  if (!proxy) {
+    const directBlobUrl = getDirectBlobDownloadUrl(id, inline);
+    if (directBlobUrl) {
+      return NextResponse.redirect(directBlobUrl, {
+        status: 302,
+        headers: {
+          'Cache-Control': 'private, no-store',
+        },
+      });
+    }
   }
 
   const fileData = await getStoredFileContent(id);
@@ -46,11 +63,7 @@ export async function GET(request: Request) {
     headers.set('Content-Length', String(fileData.size));
   }
 
-  const responseBody: BodyInit = Buffer.isBuffer(fileData.body)
-    ? new Uint8Array(fileData.body)
-    : fileData.body;
-
-  return new NextResponse(responseBody, {
+  return new NextResponse(fileData.body, {
     status: 200,
     headers,
   });

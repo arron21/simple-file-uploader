@@ -3,12 +3,14 @@ import { isAuthenticated } from '@/lib/auth';
 import {
   listStoredFiles,
   saveUploadedFile,
+  saveUploadedStream,
   deleteStoredFiles,
   getStorageMode,
   StoredFileItem,
 } from '@/lib/storage';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 export async function GET() {
   if (!(await isAuthenticated())) {
@@ -73,6 +75,50 @@ export async function POST(request: Request) {
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Failed to upload files.';
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+/**
+ * PUT /api/files?name=...&type=...
+ * Streams a raw binary file directly to storage without FormData memory buffering (supports 500MB+ local files).
+ */
+export async function PUT(request: Request) {
+  if (!(await isAuthenticated())) {
+    return NextResponse.json(
+      { error: 'Unauthorized. Password login required.' },
+      { status: 401 }
+    );
+  }
+
+  try {
+    if (!request.body) {
+      return NextResponse.json(
+        { error: 'Missing file stream body.' },
+        { status: 400 }
+      );
+    }
+
+    const url = new URL(request.url);
+    const filename = url.searchParams.get('name') || 'uploaded-file';
+    const contentType =
+      url.searchParams.get('type') ||
+      request.headers.get('content-type') ||
+      'application/octet-stream';
+
+    const saved = await saveUploadedStream({
+      body: request.body,
+      filename,
+      contentType,
+    });
+
+    return NextResponse.json({
+      uploaded: [saved],
+      storageMode: getStorageMode(),
+    });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Failed to stream upload.';
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

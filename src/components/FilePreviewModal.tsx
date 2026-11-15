@@ -47,7 +47,7 @@ export default function FilePreviewModal({
 
     let cancelled = false;
     setLoadingText(true);
-    fetch(`/api/files/download?id=${encodeURIComponent(file.id)}&inline=1`)
+    fetch(`/api/files/download?id=${encodeURIComponent(file.id)}&inline=1&proxy=1`)
       .then((res) => {
         if (!res.ok) throw new Error('Failed to load text preview');
         return res.text();

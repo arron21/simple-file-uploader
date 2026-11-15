@@ -1,6 +1,10 @@
 import crypto from 'crypto';
 import fs from 'fs/promises';
+import { createReadStream, createWriteStream } from 'fs';
 import path from 'path';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
+import type { ReadableStream as NodeReadableStream } from 'stream/web';
 import { put, list, del } from '@vercel/blob';
 
 export type StorageMode = 'vercel-blob' | 'local-disk';
@@ -34,7 +38,7 @@ interface LocalMetaRecord {
   uploadedAt: string;
 }
 
-interface EncodedFileId {
+export interface EncodedFileId {
   m: 'blob' | 'local';
   k: string; // blob URL or local key
   n: string; // original file name
@@ -97,13 +101,15 @@ const MIME_BY_EXT: Record<string, string> = {
   '.webm': 'video/webm',
   '.mov': 'video/quicktime',
   '.mkv': 'video/x-matroska',
-  // Archives
+  // Archives & Disk Images
   '.zip': 'application/zip',
   '.tar': 'application/x-tar',
   '.gz': 'application/gzip',
   '.tgz': 'application/gzip',
   '.7z': 'application/x-7z-compressed',
   '.rar': 'application/vnd.rar',
+  '.iso': 'application/x-iso9660-image',
+  '.dmg': 'application/x-apple-diskimage',
 };
 
 export function inferContentType(filename: string, providedType?: string): string {
@@ -136,7 +142,7 @@ export function categorizeFile(filename: string, contentType: string): FileCateg
     return 'code';
   }
 
-  const archiveExts = new Set(['.zip', '.tar', '.gz', '.tgz', '.7z', '.rar', '.bz2', '.xz']);
+  const archiveExts = new Set(['.zip', '.tar', '.gz', '.tgz', '.7z', '.rar', '.bz2', '.xz', '.iso', '.dmg']);
   if (archiveExts.has(ext) || mime.includes('zip') || mime.includes('tar') || mime.includes('compressed')) {
     return 'archive';
   }
@@ -159,18 +165,17 @@ export function getStorageMode(): StorageMode {
 
 export function sanitizeFilename(rawName: string): string {
   const base = path.posix.basename(rawName.replace(/\\/g, '/'));
-  // Remove control characters and path separators while preserving spaces, unicode, dots, dashes
   const cleaned = base
     .replace(/[\x00-\x1f\x80-\x9f/?<>\\:*|"]/g, '_')
     .trim();
   return cleaned.length > 0 ? cleaned.slice(0, 200) : 'unnamed-file';
 }
 
-function encodeFileId(payload: EncodedFileId): string {
+export function encodeFileId(payload: EncodedFileId): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
 
-function decodeFileId(id: string): EncodedFileId | null {
+export function decodeFileId(id: string): EncodedFileId | null {
   try {
     const parsed = JSON.parse(Buffer.from(id, 'base64url').toString('utf8'));
     if (
@@ -193,7 +198,6 @@ async function getLocalVaultDir(): Promise<string> {
     await fs.mkdir(preferredDir, { recursive: true });
     return preferredDir;
   } catch {
-    // Fallback to /tmp/local-vault when running in a read-only serverless container without BLOB_READ_WRITE_TOKEN
     const tmpDir = path.join('/tmp', 'local-vault');
     await fs.mkdir(tmpDir, { recursive: true });
     return tmpDir;
@@ -278,7 +282,7 @@ export async function listStoredFiles(): Promise<StoredFileItem[]> {
 }
 
 /**
- * Stores a single file in either Vercel Blob or Local Disk fallback.
+ * Stores a single file in either Vercel Blob (with multipart enabled for large files) or Local Disk fallback.
  */
 export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
   const mode = getStorageMode();
@@ -294,6 +298,7 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
       access: 'public',
       addRandomSuffix: false,
       contentType,
+      multipart: file.size > 4 * 1024 * 1024,
     });
 
     const id = encodeFileId({
@@ -314,24 +319,24 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
     };
   }
 
-  // Local disk fallback
+  // Local disk fallback: stream file to disk without buffering the entire file in RAM
   const vaultDir = await getLocalVaultDir();
   const key = uniquePrefix;
-  const arrayBuffer = await file.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
   const binPath = path.join(vaultDir, `${key}.bin`);
   const metaPath = path.join(vaultDir, `${key}.meta.json`);
+
+  const webStream = file.stream() as unknown as NodeReadableStream;
+  await pipeline(Readable.fromWeb(webStream), createWriteStream(binPath));
+  const stats = await fs.stat(binPath);
 
   const metaRecord: LocalMetaRecord = {
     key,
     name: cleanName,
-    size: buffer.byteLength,
+    size: stats.size,
     contentType,
     uploadedAt,
   };
 
-  await fs.writeFile(binPath, buffer);
   await fs.writeFile(metaPath, JSON.stringify(metaRecord, null, 2), 'utf8');
 
   const id = encodeFileId({
@@ -344,7 +349,7 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
   return {
     id,
     name: cleanName,
-    size: buffer.byteLength,
+    size: stats.size,
     contentType,
     category,
     uploadedAt,
@@ -353,10 +358,116 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
 }
 
 /**
- * Retrieves a file's binary stream/buffer and metadata for authenticated download or preview.
+ * Streams a raw request body directly to storage (used for large 500MB+ local-disk uploads without FormData buffering).
+ */
+export async function saveUploadedStream(params: {
+  body: ReadableStream<Uint8Array>;
+  filename: string;
+  contentType?: string;
+}): Promise<StoredFileItem> {
+  const mode = getStorageMode();
+  const cleanName = sanitizeFilename(params.filename || 'untitled');
+  const contentType = inferContentType(cleanName, params.contentType);
+  const category = categorizeFile(cleanName, contentType);
+  const uploadedAt = new Date().toISOString();
+  const uniquePrefix = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+
+  if (mode === 'vercel-blob') {
+    const pathname = `vault/${uniquePrefix}/${cleanName}`;
+    const blob = await put(pathname, params.body, {
+      access: 'public',
+      addRandomSuffix: false,
+      contentType,
+      multipart: true,
+    });
+
+    const id = encodeFileId({
+      m: 'blob',
+      k: blob.url,
+      n: cleanName,
+      t: contentType,
+    });
+
+    return {
+      id,
+      name: cleanName,
+      size: 0,
+      contentType,
+      category,
+      uploadedAt,
+      storageMode: 'vercel-blob',
+    };
+  }
+
+  const vaultDir = await getLocalVaultDir();
+  const key = uniquePrefix;
+  const binPath = path.join(vaultDir, `${key}.bin`);
+  const metaPath = path.join(vaultDir, `${key}.meta.json`);
+
+  const nodeReadable = Readable.fromWeb(params.body as unknown as NodeReadableStream);
+  await pipeline(nodeReadable, createWriteStream(binPath));
+  const stats = await fs.stat(binPath);
+
+  const metaRecord: LocalMetaRecord = {
+    key,
+    name: cleanName,
+    size: stats.size,
+    contentType,
+    uploadedAt,
+  };
+
+  await fs.writeFile(metaPath, JSON.stringify(metaRecord, null, 2), 'utf8');
+
+  const id = encodeFileId({
+    m: 'local',
+    k: key,
+    n: cleanName,
+    t: contentType,
+  });
+
+  return {
+    id,
+    name: cleanName,
+    size: stats.size,
+    contentType,
+    category,
+    uploadedAt,
+    storageMode: 'local-disk',
+  };
+}
+
+/**
+ * Resolves a validated Vercel Blob CDN URL for direct high-speed edge downloads/streaming of large files.
+ */
+export function getDirectBlobDownloadUrl(
+  id: string,
+  inline: boolean
+): string | null {
+  const decoded = decodeFileId(id);
+  if (!decoded || decoded.m !== 'blob') return null;
+
+  try {
+    const parsedUrl = new URL(decoded.k);
+    if (
+      parsedUrl.protocol !== 'https:' ||
+      !parsedUrl.hostname.endsWith('.blob.vercel-storage.com')
+    ) {
+      return null;
+    }
+    if (!inline) {
+      parsedUrl.searchParams.set('download', '1');
+    }
+    return parsedUrl.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Retrieves a file's binary stream and metadata for authenticated download or preview.
  */
 export async function getStoredFileContent(id: string): Promise<{
-  body: ReadableStream<Uint8Array> | Buffer;
+  body: ReadableStream<Uint8Array>;
   name: string;
   contentType: string;
   size?: number;
@@ -368,7 +479,6 @@ export async function getStoredFileContent(id: string): Promise<{
   const contentType = inferContentType(cleanName, decoded.t);
 
   if (decoded.m === 'blob') {
-    // Validate that the URL is an HTTPS Vercel Blob URL to prevent SSRF
     let parsedUrl: URL;
     try {
       parsedUrl = new URL(decoded.k);
@@ -405,7 +515,7 @@ export async function getStoredFileContent(id: string): Promise<{
     };
   }
 
-  // Local disk mode: prevent path traversal by ensuring key only contains alphanumeric & hyphen
+  // Local disk mode: stream from disk via createReadStream so 500MB+ files never buffer into RAM
   if (!/^[a-zA-Z0-9-]+$/.test(decoded.k)) {
     return null;
   }
@@ -413,12 +523,14 @@ export async function getStoredFileContent(id: string): Promise<{
   const vaultDir = await getLocalVaultDir();
   const binPath = path.join(vaultDir, `${decoded.k}.bin`);
   try {
-    const buffer = await fs.readFile(binPath);
+    const stats = await fs.stat(binPath);
+    const nodeStream = createReadStream(binPath);
+    const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
     return {
-      body: buffer,
+      body: webStream,
       name: cleanName,
       contentType,
-      size: buffer.byteLength,
+      size: stats.size,
     };
   } catch {
     return null;

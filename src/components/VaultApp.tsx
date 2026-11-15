@@ -16,8 +16,10 @@ interface UploadQueueItem {
   uid: string;
   name: string;
   size: number;
+  loadedBytes: number;
   progress: number;
-  status: 'uploading' | 'done' | 'error';
+  isMultipart: boolean;
+  status: 'uploading' | 'done' | 'error' | 'cancelled';
   errorMessage?: string;
 }
 
@@ -95,6 +97,7 @@ export default function VaultApp({
 
   // Upload state
   const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
+  const abortControllersRef = useRef<Map<string, () => void>>(new Map());
   const [isDraggingOverZone, setIsDraggingOverZone] = useState(false);
   const [isDraggingOverWindow, setIsDraggingOverWindow] = useState(false);
   const dragCounterRef = useRef(0);
@@ -153,7 +156,23 @@ export default function VaultApp({
     }
   }, []);
 
-  // Upload handler supporting both standard XHR progress and direct @vercel/blob/client for large files
+  const handleCancelUpload = (uid: string) => {
+    const abortFn = abortControllersRef.current.get(uid);
+    if (abortFn) {
+      abortFn();
+      abortControllersRef.current.delete(uid);
+    }
+    setUploadQueue((prev) =>
+      prev.map((item) =>
+        item.uid === uid
+          ? { ...item, status: 'cancelled', errorMessage: 'Cancelled by user' }
+          : item
+      )
+    );
+  };
+
+  // Upload handler supporting 500MB+ / multi-GB files via @vercel/blob/client multipart chunking
+  // and streaming binary PUT for local disk mode.
   const handleFilesUpload = useCallback(
     async (incomingFiles: FileList | File[]) => {
       const fileArray = Array.from(incomingFiles);
@@ -161,11 +180,15 @@ export default function VaultApp({
 
       setGlobalError(null);
 
+      const MULTIPART_THRESHOLD = 4 * 1024 * 1024; // 4 MB
+
       const newQueueItems: UploadQueueItem[] = fileArray.map((f, idx) => ({
         uid: `${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`,
         name: f.name,
         size: f.size,
+        loadedBytes: 0,
         progress: 0,
+        isMultipart: f.size > MULTIPART_THRESHOLD,
         status: 'uploading',
       }));
 
@@ -174,47 +197,71 @@ export default function VaultApp({
       for (let i = 0; i < fileArray.length; i++) {
         const file = fileArray[i];
         const queueItem = newQueueItems[i];
+        const useMultipart = file.size > MULTIPART_THRESHOLD;
 
         try {
-          // Use direct @vercel/blob/client upload when in vercel-blob mode and file > 4 MB
-          if (storageMode === 'vercel-blob' && file.size > 4 * 1024 * 1024) {
+          if (storageMode === 'vercel-blob') {
+            const abortController = new AbortController();
+            abortControllersRef.current.set(queueItem.uid, () =>
+              abortController.abort()
+            );
+
             const uniquePrefix = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-            const safeName = file.name.replace(/[^\w.\- ()]/g, '_');
+            const safeName =
+              file.name.replace(/[\x00-\x1f\x80-\x9f/?<>\\:*|"]/g, '_').trim() ||
+              'unnamed-file';
+
             await vercelClientUpload(`vault/${uniquePrefix}/${safeName}`, file, {
               access: 'public',
               handleUploadUrl: '/api/files/client-upload',
+              // Enable 8 MB parallel multipart chunking + automatic part retries for all files > 4 MB (supports up to 5 TB!)
+              multipart: useMultipart,
+              contentType: file.type || undefined,
+              abortSignal: abortController.signal,
               onUploadProgress: (progressEvent) => {
                 setUploadQueue((prev) =>
                   prev.map((item) =>
                     item.uid === queueItem.uid
-                      ? { ...item, progress: Math.round(progressEvent.percentage) }
+                      ? {
+                          ...item,
+                          loadedBytes: progressEvent.loaded,
+                          progress: Math.min(99, Math.round(progressEvent.percentage)),
+                        }
                       : item
                   )
                 );
               },
             });
 
+            abortControllersRef.current.delete(queueItem.uid);
+
             setUploadQueue((prev) =>
               prev.map((item) =>
                 item.uid === queueItem.uid
-                  ? { ...item, progress: 100, status: 'done' }
+                  ? {
+                      ...item,
+                      loadedBytes: file.size,
+                      progress: 100,
+                      status: 'done',
+                    }
                   : item
               )
             );
             await fetchFiles();
           } else {
-            // Standard multipart XHR upload with granular progress events
+            // Local Disk mode: stream raw binary file via PUT /api/files so 500MB+ files never buffer into FormData memory
             const uploadedItem = await new Promise<StoredFileItem>((resolve, reject) => {
               const xhr = new XMLHttpRequest();
-              const formData = new FormData();
-              formData.append('files', file);
+              abortControllersRef.current.set(queueItem.uid, () => xhr.abort());
 
               xhr.upload.addEventListener('progress', (event) => {
                 if (event.lengthComputable) {
                   const pct = Math.min(99, Math.round((event.loaded / event.total) * 100));
                   setUploadQueue((prev) =>
                     prev.map((item) =>
-                      item.uid === queueItem.uid ? { ...item, progress: pct } : item
+                      item.uid === queueItem.uid
+                        ? { ...item, loadedBytes: event.loaded, progress: pct }
+                        : item
                     )
                   );
                 }
@@ -237,14 +284,32 @@ export default function VaultApp({
                 reject(new Error('Network error while uploading file.'));
               });
 
-              xhr.open('POST', '/api/files');
-              xhr.send(formData);
+              xhr.addEventListener('abort', () => {
+                reject(new Error('ABORTED'));
+              });
+
+              const putUrl = `/api/files?name=${encodeURIComponent(file.name)}&type=${encodeURIComponent(
+                file.type || 'application/octet-stream'
+              )}`;
+              xhr.open('PUT', putUrl);
+              xhr.setRequestHeader(
+                'Content-Type',
+                file.type || 'application/octet-stream'
+              );
+              xhr.send(file);
             });
+
+            abortControllersRef.current.delete(queueItem.uid);
 
             setUploadQueue((prev) =>
               prev.map((item) =>
                 item.uid === queueItem.uid
-                  ? { ...item, progress: 100, status: 'done' }
+                  ? {
+                      ...item,
+                      loadedBytes: file.size,
+                      progress: 100,
+                      status: 'done',
+                    }
                   : item
               )
             );
@@ -252,10 +317,14 @@ export default function VaultApp({
             setFiles((prev) => [uploadedItem, ...prev]);
           }
         } catch (err) {
+          abortControllersRef.current.delete(queueItem.uid);
           const message = err instanceof Error ? err.message : 'Upload failed';
+          if (message === 'ABORTED' || (err instanceof Error && err.name === 'AbortError')) {
+            continue;
+          }
           setUploadQueue((prev) =>
             prev.map((item) =>
-              item.uid === queueItem.uid
+              item.uid === queueItem.uid && item.status !== 'cancelled'
                 ? { ...item, status: 'error', errorMessage: message }
                 : item
             )
@@ -500,7 +569,7 @@ export default function VaultApp({
               className="storage-badge"
               title={
                 storageMode === 'vercel-blob'
-                  ? 'Connected to Vercel Blob cloud storage'
+                  ? 'Connected to Vercel Blob cloud storage (Multipart 5TB enabled)'
                   : 'Using Local Disk storage (set BLOB_READ_WRITE_TOKEN in Vercel for Vercel Blob)'
               }
             >
@@ -732,8 +801,8 @@ export default function VaultApp({
                     Drop files here, paste from clipboard, or browse to upload
                   </h1>
                   <p className="dropzone-subtitle">
-                    Supports any file format (images, PDFs, archives, documents, audio, video, code).
-                    Multi-file upload enabled.
+                    Supports any file format and size (500 MB+ / multi-GB files automatically use
+                    8 MB parallel multipart chunking with auto-retry).
                   </p>
                 </div>
               </div>
@@ -779,23 +848,65 @@ export default function VaultApp({
                 {uploadQueue.map((item) => (
                   <div key={item.uid} className="upload-queue-item">
                     <div className="upload-item-top">
-                      <span className="upload-item-name">{item.name}</span>
-                      <span className="mono" style={{ fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
-                        {item.status === 'uploading' && `${item.progress}% · ${formatBytes(item.size)}`}
-                        {item.status === 'done' && `Uploaded · ${formatBytes(item.size)}`}
-                        {item.status === 'error' && (
-                          <span style={{ color: 'var(--status-danger)' }}>
-                            {item.errorMessage || 'Failed'}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', minWidth: 0 }}>
+                        <span className="upload-item-name">{item.name}</span>
+                        {item.isMultipart && (
+                          <span
+                            className="mono"
+                            style={{
+                              fontSize: '0.68rem',
+                              padding: '0.1rem 0.4rem',
+                              borderRadius: '4px',
+                              backgroundColor: 'var(--bg-recessed)',
+                              border: '1px solid var(--border-subtle)',
+                              color: 'var(--text-secondary)',
+                              flexShrink: 0,
+                            }}
+                          >
+                            Multipart 8MB Chunks
                           </span>
                         )}
-                      </span>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexShrink: 0 }}>
+                        <span className="mono" style={{ fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                          {item.status === 'uploading' &&
+                            `${formatBytes(item.loadedBytes)} / ${formatBytes(item.size)} (${item.progress}%)`}
+                          {item.status === 'done' && `Uploaded · ${formatBytes(item.size)}`}
+                          {item.status === 'cancelled' && 'Cancelled'}
+                          {item.status === 'error' && (
+                            <span style={{ color: 'var(--status-danger)' }}>
+                              {item.errorMessage || 'Failed'}
+                            </span>
+                          )}
+                        </span>
+                        {item.status === 'uploading' && (
+                          <button
+                            type="button"
+                            className="btn btn-ghost"
+                            style={{ padding: '0.15rem 0.45rem', fontSize: '0.73rem', color: 'var(--status-danger)' }}
+                            onClick={() => handleCancelUpload(item.uid)}
+                          >
+                            Cancel
+                          </button>
+                        )}
+                      </div>
                     </div>
                     <div className="upload-progress-track">
                       <div
                         className={`upload-progress-fill ${
-                          item.status === 'done' ? 'done' : item.status === 'error' ? 'error' : ''
+                          item.status === 'done'
+                            ? 'done'
+                            : item.status === 'error' || item.status === 'cancelled'
+                            ? 'error'
+                            : ''
                         }`}
-                        style={{ width: `${item.status === 'error' ? 100 : item.progress}%` }}
+                        style={{
+                          width: `${
+                            item.status === 'error' || item.status === 'cancelled'
+                              ? 100
+                              : item.progress
+                          }%`,
+                        }}
                       />
                     </div>
                   </div>
