@@ -6,6 +6,7 @@ import {
   isUsingDefaultPassword,
 } from '@/lib/auth';
 import { getStorageMode } from '@/lib/storage';
+import { getActiveEntitlement } from '@/lib/monetization-server';
 
 export async function POST(request: Request) {
   try {
@@ -28,10 +29,12 @@ export async function POST(request: Request) {
     }
 
     const token = createSessionToken();
+    const entitlement = await getActiveEntitlement();
     const response = NextResponse.json({
       authenticated: true,
       storageMode: getStorageMode(),
       isDefaultPassword: isUsingDefaultPassword(),
+      entitlement,
     });
 
     response.cookies.set({

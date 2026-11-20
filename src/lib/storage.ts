@@ -5,7 +5,12 @@ import path from 'path';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'stream/web';
-import { put, list, del } from '@vercel/blob';
+import { put, list, del, rename } from '@vercel/blob';
+import {
+  LIFETIME_OPTIONS,
+  isValidLifetimeId,
+  type LifetimeId,
+} from './monetization';
 
 export type StorageMode = 'vercel-blob' | 'local-disk';
 
@@ -27,6 +32,8 @@ export interface StoredFileItem {
   contentType: string;
   category: FileCategory;
   uploadedAt: string;
+  expiresAt: string | null; // ISO timestamp or null if permanent
+  lifetime: LifetimeId;
   storageMode: StorageMode;
 }
 
@@ -36,6 +43,8 @@ interface LocalMetaRecord {
   size: number;
   contentType: string;
   uploadedAt: string;
+  expiresAt?: string | null;
+  lifetime?: LifetimeId;
 }
 
 export interface EncodedFileId {
@@ -43,6 +52,10 @@ export interface EncodedFileId {
   k: string; // blob URL or local key
   n: string; // original file name
   t?: string; // contentType
+  e?: number; // expiresAt epoch ms (0 or undefined = permanent)
+  l?: LifetimeId; // lifetime tier
+  s?: number; // size in bytes (useful when renaming)
+  u?: string; // uploadedAt ISO
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -171,6 +184,69 @@ export function sanitizeFilename(rawName: string): string {
   return cleaned.length > 0 ? cleaned.slice(0, 200) : 'unnamed-file';
 }
 
+export function computeExpirationMs(
+  lifetime: LifetimeId,
+  fromMs = Date.now()
+): number {
+  const cfg = LIFETIME_OPTIONS[lifetime];
+  if (!cfg || cfg.durationMs === null) return 0;
+  return fromMs + cfg.durationMs;
+}
+
+/**
+ * Builds a structured vault pathname encoding expiration epoch ms and lifetime tier:
+ * vault/exp_<expiresAtMs>_<lifetime>_<uniqueId>/<cleanName>
+ */
+export function buildVaultPathname(
+  rawFilename: string,
+  lifetime: LifetimeId = '7d',
+  nowMs = Date.now()
+): { pathname: string; cleanName: string; expiresAtMs: number } {
+  const cleanName = sanitizeFilename(rawFilename);
+  const expiresAtMs = computeExpirationMs(lifetime, nowMs);
+  const uniqueId = `${nowMs}-${crypto.randomBytes(5).toString('hex')}`;
+  const pathname = `vault/exp_${expiresAtMs}_${lifetime}_${uniqueId}/${cleanName}`;
+  return { pathname, cleanName, expiresAtMs };
+}
+
+const VAULT_EXP_REGEX =
+  /^vault\/exp_(\d+)_(1d|7d|30d|365d|forever)_([^/]+)\/(.+)$/;
+
+export function parseVaultPathname(pathname: string): {
+  name: string;
+  expiresAtMs: number;
+  expiresAt: string | null;
+  lifetime: LifetimeId;
+  uniqueId: string | null;
+} {
+  const match = pathname.match(VAULT_EXP_REGEX);
+  if (match) {
+    const expiresAtMs = Number(match[1]);
+    const lifetime = match[2] as LifetimeId;
+    const uniqueId = match[3];
+    const name = sanitizeFilename(match[4]);
+    return {
+      name,
+      expiresAtMs,
+      expiresAt: expiresAtMs > 0 ? new Date(expiresAtMs).toISOString() : null,
+      lifetime,
+      uniqueId,
+    };
+  }
+
+  // Legacy pre-monetization pathnames: vault/<uniquePrefix>/<filename>
+  const segments = pathname.split('/');
+  const rawFilename = segments[segments.length - 1] || pathname;
+  const uniqueId = segments.length >= 3 ? segments[1] : null;
+  return {
+    name: sanitizeFilename(rawFilename),
+    expiresAtMs: 0,
+    expiresAt: null,
+    lifetime: 'forever',
+    uniqueId,
+  };
+}
+
 export function encodeFileId(payload: EncodedFileId): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
 }
@@ -192,6 +268,26 @@ export function decodeFileId(id: string): EncodedFileId | null {
   }
 }
 
+export function isEncodedFileExpired(id: string): boolean {
+  const decoded = decodeFileId(id);
+  if (!decoded) return false;
+  if (typeof decoded.e === 'number' && decoded.e > 0 && decoded.e <= Date.now()) {
+    return true;
+  }
+  if (decoded.m === 'blob') {
+    try {
+      const u = new URL(decoded.k);
+      const parsed = parseVaultPathname(u.pathname.replace(/^\//, ''));
+      if (parsed.expiresAtMs > 0 && parsed.expiresAtMs <= Date.now()) {
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return false;
+}
+
 async function getLocalVaultDir(): Promise<string> {
   const preferredDir = path.join(process.cwd(), '.local-vault');
   try {
@@ -205,36 +301,115 @@ async function getLocalVaultDir(): Promise<string> {
 }
 
 /**
- * Lists all uploaded files sorted from newest to oldest.
+ * Proactively scans and deletes all expired files from Vercel Blob or Local Disk.
+ * Used by both `/api/cron/cleanup` and lazy cleanup during file listing.
  */
-export async function listStoredFiles(): Promise<StoredFileItem[]> {
+export async function purgeExpiredFiles(): Promise<{
+  scannedCount: number;
+  deletedCount: number;
+}> {
   const mode = getStorageMode();
+  const now = Date.now();
 
   if (mode === 'vercel-blob') {
     const { blobs } = await list({ prefix: 'vault/' });
-    const items: StoredFileItem[] = blobs.map((blob) => {
-      const segments = blob.pathname.split('/');
-      const rawFilename = segments[segments.length - 1] || blob.pathname;
-      const name = sanitizeFilename(rawFilename);
-      const contentType = inferContentType(name);
-      const category = categorizeFile(name, contentType);
+    const expiredUrls: string[] = [];
+
+    for (const blob of blobs) {
+      const parsed = parseVaultPathname(blob.pathname);
+      if (parsed.expiresAtMs > 0 && parsed.expiresAtMs <= now) {
+        expiredUrls.push(blob.url);
+      }
+    }
+
+    if (expiredUrls.length > 0) {
+      await del(expiredUrls);
+    }
+
+    return {
+      scannedCount: blobs.length,
+      deletedCount: expiredUrls.length,
+    };
+  }
+
+  const vaultDir = await getLocalVaultDir();
+  const entries = await fs.readdir(vaultDir);
+  const metaFiles = entries.filter((f) => f.endsWith('.meta.json'));
+  let deletedCount = 0;
+
+  for (const metaFile of metaFiles) {
+    try {
+      const metaPath = path.join(vaultDir, metaFile);
+      const raw = await fs.readFile(metaPath, 'utf8');
+      const meta = JSON.parse(raw) as LocalMetaRecord;
+      const expMs = meta.expiresAt ? new Date(meta.expiresAt).getTime() : 0;
+      if (expMs > 0 && expMs <= now) {
+        const binPath = path.join(vaultDir, `${meta.key}.bin`);
+        await Promise.allSettled([fs.unlink(binPath), fs.unlink(metaPath)]);
+        deletedCount += 1;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    scannedCount: metaFiles.length,
+    deletedCount,
+  };
+}
+
+/**
+ * Lists all active (unexpired) uploaded files sorted from newest to oldest,
+ * while lazily purging any expired files encountered.
+ */
+export async function listStoredFiles(): Promise<StoredFileItem[]> {
+  const mode = getStorageMode();
+  const now = Date.now();
+
+  if (mode === 'vercel-blob') {
+    const { blobs } = await list({ prefix: 'vault/' });
+    const expiredUrls: string[] = [];
+    const items: StoredFileItem[] = [];
+
+    for (const blob of blobs) {
+      const parsed = parseVaultPathname(blob.pathname);
+      if (parsed.expiresAtMs > 0 && parsed.expiresAtMs <= now) {
+        expiredUrls.push(blob.url);
+        continue;
+      }
+
+      const contentType = inferContentType(parsed.name);
+      const category = categorizeFile(parsed.name, contentType);
+      const uploadedIso = new Date(blob.uploadedAt).toISOString();
       const id = encodeFileId({
         m: 'blob',
         k: blob.url,
-        n: name,
+        n: parsed.name,
         t: contentType,
+        e: parsed.expiresAtMs,
+        l: parsed.lifetime,
+        s: blob.size,
+        u: uploadedIso,
       });
 
-      return {
+      items.push({
         id,
-        name,
+        name: parsed.name,
         size: blob.size,
         contentType,
         category,
-        uploadedAt: new Date(blob.uploadedAt).toISOString(),
+        uploadedAt: uploadedIso,
+        expiresAt: parsed.expiresAt,
+        lifetime: parsed.lifetime,
         storageMode: 'vercel-blob',
-      };
-    });
+      });
+    }
+
+    if (expiredUrls.length > 0) {
+      // Fire-and-forget cleanup of expired blobs
+      del(expiredUrls).catch(() => {});
+    }
 
     items.sort(
       (a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
@@ -250,8 +425,23 @@ export async function listStoredFiles(): Promise<StoredFileItem[]> {
   const items: StoredFileItem[] = [];
   for (const metaFile of metaFiles) {
     try {
-      const raw = await fs.readFile(path.join(vaultDir, metaFile), 'utf8');
+      const metaPath = path.join(vaultDir, metaFile);
+      const raw = await fs.readFile(metaPath, 'utf8');
       const meta = JSON.parse(raw) as LocalMetaRecord;
+      const expMs = meta.expiresAt ? new Date(meta.expiresAt).getTime() : 0;
+
+      if (expMs > 0 && expMs <= now) {
+        const binPath = path.join(vaultDir, `${meta.key}.bin`);
+        Promise.allSettled([fs.unlink(binPath), fs.unlink(metaPath)]).catch(() => {});
+        continue;
+      }
+
+      const lifetime: LifetimeId = isValidLifetimeId(meta.lifetime)
+        ? meta.lifetime
+        : meta.expiresAt
+        ? '7d'
+        : 'forever';
+      const expiresAt = expMs > 0 ? new Date(expMs).toISOString() : null;
       const contentType = inferContentType(meta.name, meta.contentType);
       const category = categorizeFile(meta.name, contentType);
       const id = encodeFileId({
@@ -259,6 +449,10 @@ export async function listStoredFiles(): Promise<StoredFileItem[]> {
         k: meta.key,
         n: meta.name,
         t: contentType,
+        e: expMs,
+        l: lifetime,
+        s: meta.size,
+        u: meta.uploadedAt,
       });
 
       items.push({
@@ -268,6 +462,8 @@ export async function listStoredFiles(): Promise<StoredFileItem[]> {
         contentType,
         category,
         uploadedAt: meta.uploadedAt,
+        expiresAt,
+        lifetime,
         storageMode: 'local-disk',
       });
     } catch {
@@ -282,23 +478,32 @@ export async function listStoredFiles(): Promise<StoredFileItem[]> {
 }
 
 /**
- * Stores a single file in either Vercel Blob (with multipart enabled for large files) or Local Disk fallback.
+ * Stores a single file in either Vercel Blob (with ttlDays + multipart) or Local Disk fallback.
  */
-export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
+export async function saveUploadedFile(
+  file: File,
+  lifetime: LifetimeId = '7d'
+): Promise<StoredFileItem> {
   const mode = getStorageMode();
-  const cleanName = sanitizeFilename(file.name || 'untitled');
+  const nowMs = Date.now();
+  const { pathname, cleanName, expiresAtMs } = buildVaultPathname(
+    file.name || 'untitled',
+    lifetime,
+    nowMs
+  );
+  const expiresAt = expiresAtMs > 0 ? new Date(expiresAtMs).toISOString() : null;
+  const ttlDays = LIFETIME_OPTIONS[lifetime].ttlDays;
   const contentType = inferContentType(cleanName, file.type);
   const category = categorizeFile(cleanName, contentType);
-  const uploadedAt = new Date().toISOString();
-  const uniquePrefix = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  const uploadedAt = new Date(nowMs).toISOString();
 
   if (mode === 'vercel-blob') {
-    const pathname = `vault/${uniquePrefix}/${cleanName}`;
     const blob = await put(pathname, file, {
       access: 'public',
       addRandomSuffix: false,
       contentType,
       multipart: file.size > 4 * 1024 * 1024,
+      ...(ttlDays !== null ? { ttlDays } : {}),
     });
 
     const id = encodeFileId({
@@ -306,6 +511,10 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
       k: blob.url,
       n: cleanName,
       t: contentType,
+      e: expiresAtMs,
+      l: lifetime,
+      s: file.size,
+      u: uploadedAt,
     });
 
     return {
@@ -315,13 +524,15 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
       contentType,
       category,
       uploadedAt,
+      expiresAt,
+      lifetime,
       storageMode: 'vercel-blob',
     };
   }
 
-  // Local disk fallback: stream file to disk without buffering the entire file in RAM
+  // Local disk fallback
   const vaultDir = await getLocalVaultDir();
-  const key = uniquePrefix;
+  const key = `${nowMs}-${crypto.randomBytes(6).toString('hex')}`;
   const binPath = path.join(vaultDir, `${key}.bin`);
   const metaPath = path.join(vaultDir, `${key}.meta.json`);
 
@@ -335,6 +546,8 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
     size: stats.size,
     contentType,
     uploadedAt,
+    expiresAt,
+    lifetime,
   };
 
   await fs.writeFile(metaPath, JSON.stringify(metaRecord, null, 2), 'utf8');
@@ -344,6 +557,10 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
     k: key,
     n: cleanName,
     t: contentType,
+    e: expiresAtMs,
+    l: lifetime,
+    s: stats.size,
+    u: uploadedAt,
   });
 
   return {
@@ -353,32 +570,42 @@ export async function saveUploadedFile(file: File): Promise<StoredFileItem> {
     contentType,
     category,
     uploadedAt,
+    expiresAt,
+    lifetime,
     storageMode: 'local-disk',
   };
 }
 
 /**
- * Streams a raw request body directly to storage (used for large 500MB+ local-disk uploads without FormData buffering).
+ * Streams a raw request body directly to storage (used for large local-disk uploads without FormData buffering).
  */
 export async function saveUploadedStream(params: {
   body: ReadableStream<Uint8Array>;
   filename: string;
   contentType?: string;
+  lifetime?: LifetimeId;
 }): Promise<StoredFileItem> {
   const mode = getStorageMode();
-  const cleanName = sanitizeFilename(params.filename || 'untitled');
+  const lifetime: LifetimeId = params.lifetime || '7d';
+  const nowMs = Date.now();
+  const { pathname, cleanName, expiresAtMs } = buildVaultPathname(
+    params.filename || 'untitled',
+    lifetime,
+    nowMs
+  );
+  const expiresAt = expiresAtMs > 0 ? new Date(expiresAtMs).toISOString() : null;
+  const ttlDays = LIFETIME_OPTIONS[lifetime].ttlDays;
   const contentType = inferContentType(cleanName, params.contentType);
   const category = categorizeFile(cleanName, contentType);
-  const uploadedAt = new Date().toISOString();
-  const uniquePrefix = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  const uploadedAt = new Date(nowMs).toISOString();
 
   if (mode === 'vercel-blob') {
-    const pathname = `vault/${uniquePrefix}/${cleanName}`;
     const blob = await put(pathname, params.body, {
       access: 'public',
       addRandomSuffix: false,
       contentType,
       multipart: true,
+      ...(ttlDays !== null ? { ttlDays } : {}),
     });
 
     const id = encodeFileId({
@@ -386,6 +613,9 @@ export async function saveUploadedStream(params: {
       k: blob.url,
       n: cleanName,
       t: contentType,
+      e: expiresAtMs,
+      l: lifetime,
+      u: uploadedAt,
     });
 
     return {
@@ -395,12 +625,14 @@ export async function saveUploadedStream(params: {
       contentType,
       category,
       uploadedAt,
+      expiresAt,
+      lifetime,
       storageMode: 'vercel-blob',
     };
   }
 
   const vaultDir = await getLocalVaultDir();
-  const key = uniquePrefix;
+  const key = `${nowMs}-${crypto.randomBytes(6).toString('hex')}`;
   const binPath = path.join(vaultDir, `${key}.bin`);
   const metaPath = path.join(vaultDir, `${key}.meta.json`);
 
@@ -414,6 +646,8 @@ export async function saveUploadedStream(params: {
     size: stats.size,
     contentType,
     uploadedAt,
+    expiresAt,
+    lifetime,
   };
 
   await fs.writeFile(metaPath, JSON.stringify(metaRecord, null, 2), 'utf8');
@@ -423,6 +657,10 @@ export async function saveUploadedStream(params: {
     k: key,
     n: cleanName,
     t: contentType,
+    e: expiresAtMs,
+    l: lifetime,
+    s: stats.size,
+    u: uploadedAt,
   });
 
   return {
@@ -432,17 +670,143 @@ export async function saveUploadedStream(params: {
     contentType,
     category,
     uploadedAt,
+    expiresAt,
+    lifetime,
     storageMode: 'local-disk',
   };
 }
 
 /**
+ * Updates / extends an existing stored file's lifetime without re-uploading it!
+ */
+export async function updateStoredFileLifetime(
+  id: string,
+  newLifetime: LifetimeId
+): Promise<StoredFileItem | null> {
+  const decoded = decodeFileId(id);
+  if (!decoded) return null;
+
+  const nowMs = Date.now();
+  const { pathname: newPathname, cleanName, expiresAtMs } = buildVaultPathname(
+    decoded.n,
+    newLifetime,
+    nowMs
+  );
+  const expiresAt = expiresAtMs > 0 ? new Date(expiresAtMs).toISOString() : null;
+  const ttlDays = LIFETIME_OPTIONS[newLifetime].ttlDays;
+  const contentType = inferContentType(cleanName, decoded.t);
+  const category = categorizeFile(cleanName, contentType);
+
+  if (decoded.m === 'blob') {
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(decoded.k);
+    } catch {
+      return null;
+    }
+    if (
+      parsedUrl.protocol !== 'https:' ||
+      !parsedUrl.hostname.endsWith('.blob.vercel-storage.com')
+    ) {
+      return null;
+    }
+
+    const renamed = await rename(parsedUrl.toString(), newPathname, {
+      access: 'public',
+      addRandomSuffix: false,
+      contentType,
+      ...(ttlDays !== null ? { ttlDays } : {}),
+    });
+
+    const uploadedAt = decoded.u || new Date(nowMs).toISOString();
+    const size = decoded.s ?? 0;
+
+    const updatedId = encodeFileId({
+      m: 'blob',
+      k: renamed.url,
+      n: cleanName,
+      t: contentType,
+      e: expiresAtMs,
+      l: newLifetime,
+      s: size,
+      u: uploadedAt,
+    });
+
+    return {
+      id: updatedId,
+      name: cleanName,
+      size,
+      contentType,
+      category,
+      uploadedAt,
+      expiresAt,
+      lifetime: newLifetime,
+      storageMode: 'vercel-blob',
+    };
+  }
+
+  // Local disk mode
+  if (!/^[a-zA-Z0-9-]+$/.test(decoded.k)) {
+    return null;
+  }
+
+  const vaultDir = await getLocalVaultDir();
+  const metaPath = path.join(vaultDir, `${decoded.k}.meta.json`);
+  try {
+    const raw = await fs.readFile(metaPath, 'utf8');
+    const meta = JSON.parse(raw) as LocalMetaRecord;
+    meta.expiresAt = expiresAt;
+    meta.lifetime = newLifetime;
+    await fs.writeFile(metaPath, JSON.stringify(metaRecordSafe(meta), null, 2), 'utf8');
+
+    const updatedId = encodeFileId({
+      m: 'local',
+      k: meta.key,
+      n: meta.name,
+      t: contentType,
+      e: expiresAtMs,
+      l: newLifetime,
+      s: meta.size,
+      u: meta.uploadedAt,
+    });
+
+    return {
+      id: updatedId,
+      name: meta.name,
+      size: meta.size,
+      contentType,
+      category,
+      uploadedAt: meta.uploadedAt,
+      expiresAt,
+      lifetime: newLifetime,
+      storageMode: 'local-disk',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function metaRecordSafe(meta: LocalMetaRecord): LocalMetaRecord {
+  return {
+    key: meta.key,
+    name: meta.name,
+    size: meta.size,
+    contentType: meta.contentType,
+    uploadedAt: meta.uploadedAt,
+    expiresAt: meta.expiresAt ?? null,
+    lifetime: meta.lifetime ?? '7d',
+  };
+}
+
+/**
  * Resolves a validated Vercel Blob CDN URL for direct high-speed edge downloads/streaming of large files.
+ * Returns null if invalid or expired.
  */
 export function getDirectBlobDownloadUrl(
   id: string,
   inline: boolean
 ): string | null {
+  if (isEncodedFileExpired(id)) return null;
   const decoded = decodeFileId(id);
   if (!decoded || decoded.m !== 'blob') return null;
 
@@ -472,6 +836,7 @@ export async function getStoredFileContent(id: string): Promise<{
   contentType: string;
   size?: number;
 } | null> {
+  if (isEncodedFileExpired(id)) return null;
   const decoded = decodeFileId(id);
   if (!decoded) return null;
 
@@ -515,14 +880,22 @@ export async function getStoredFileContent(id: string): Promise<{
     };
   }
 
-  // Local disk mode: stream from disk via createReadStream so 500MB+ files never buffer into RAM
   if (!/^[a-zA-Z0-9-]+$/.test(decoded.k)) {
     return null;
   }
 
   const vaultDir = await getLocalVaultDir();
   const binPath = path.join(vaultDir, `${decoded.k}.bin`);
+  const metaPath = path.join(vaultDir, `${decoded.k}.meta.json`);
   try {
+    // Verify local metadata hasn't expired
+    const rawMeta = await fs.readFile(metaPath, 'utf8');
+    const meta = JSON.parse(rawMeta) as LocalMetaRecord;
+    if (meta.expiresAt && new Date(meta.expiresAt).getTime() <= Date.now()) {
+      await Promise.allSettled([fs.unlink(binPath), fs.unlink(metaPath)]);
+      return null;
+    }
+
     const stats = await fs.stat(binPath);
     const nodeStream = createReadStream(binPath);
     const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;

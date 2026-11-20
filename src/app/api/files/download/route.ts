@@ -1,6 +1,11 @@
 import { NextResponse } from 'next/server';
 import { isAuthenticated } from '@/lib/auth';
-import { getDirectBlobDownloadUrl, getStoredFileContent } from '@/lib/storage';
+import {
+  getDirectBlobDownloadUrl,
+  getStoredFileContent,
+  isEncodedFileExpired,
+  deleteStoredFiles,
+} from '@/lib/storage';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -25,9 +30,17 @@ export async function GET(request: Request) {
     );
   }
 
+  // Block and purge expired files immediately
+  if (isEncodedFileExpired(id)) {
+    deleteStoredFiles([id]).catch(() => {});
+    return NextResponse.json(
+      { error: 'This file has expired and was automatically deleted.' },
+      { status: 410 }
+    );
+  }
+
   // For Vercel Blob files (unless proxy=1 is requested for small text/code fetch previews),
-  // redirect authenticated users directly to the Vercel Blob Edge CDN URL so 500MB+ files
-  // download and stream at full CDN speed with HTTP Range support and zero serverless limits.
+  // redirect authenticated users directly to the Vercel Blob Edge CDN URL.
   if (!proxy) {
     const directBlobUrl = getDirectBlobDownloadUrl(id, inline);
     if (directBlobUrl) {

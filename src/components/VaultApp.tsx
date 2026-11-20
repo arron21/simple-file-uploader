@@ -3,13 +3,25 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { upload as vercelClientUpload } from '@vercel/blob/client';
 import type { StoredFileItem, StorageMode, FileCategory } from '@/lib/storage';
+import {
+  ORDERED_LIFETIMES,
+  LIFETIME_OPTIONS,
+  canUseLifetime,
+  type ActiveEntitlement,
+  type LifetimeId,
+} from '@/lib/monetization';
 import FilePreviewModal from './FilePreviewModal';
+import AdBanner from './AdBanner';
+import DownloadInterstitialModal from './DownloadInterstitialModal';
+import UpgradeModal from './UpgradeModal';
+import FileLifetimeModal from './FileLifetimeModal';
 
 interface VaultAppProps {
   initialAuthenticated: boolean;
   initialStorageMode: StorageMode;
   initialIsDefaultPassword: boolean;
   initialFiles: StoredFileItem[];
+  initialEntitlement: ActiveEntitlement;
 }
 
 interface UploadQueueItem {
@@ -19,6 +31,7 @@ interface UploadQueueItem {
   loadedBytes: number;
   progress: number;
   isMultipart: boolean;
+  lifetimeLabel: string;
   status: 'uploading' | 'done' | 'error' | 'cancelled';
   errorMessage?: string;
 }
@@ -63,6 +76,32 @@ export function formatDate(iso: string): string {
   }
 }
 
+export function formatExpiryLabel(expiresAt: string | null): string {
+  if (!expiresAt) return 'Permanent';
+  const diffMs = new Date(expiresAt).getTime() - Date.now();
+  if (diffMs <= 0) return 'Expired';
+
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const days = Math.floor(hours / 24);
+
+  if (days >= 30) {
+    const months = Math.floor(days / 30);
+    return months >= 12 ? 'Expires in ~1 yr' : `Expires in ${days}d`;
+  }
+  if (days >= 1) {
+    const remHours = hours % 24;
+    return remHours > 0 ? `Expires in ${days}d ${remHours}h` : `Expires in ${days}d`;
+  }
+  const minutes = Math.max(1, Math.floor(diffMs / (1000 * 60)));
+  return hours >= 1 ? `Expires in ${hours}h` : `Expires in ${minutes}m`;
+}
+
+function isExpiringSoon(expiresAt: string | null): boolean {
+  if (!expiresAt) return false;
+  const diffMs = new Date(expiresAt).getTime() - Date.now();
+  return diffMs > 0 && diffMs <= 48 * 60 * 60 * 1000;
+}
+
 function getExtensionBadge(filename: string, category: FileCategory): string {
   const parts = filename.split('.');
   if (parts.length > 1) {
@@ -72,32 +111,64 @@ function getExtensionBadge(filename: string, category: FileCategory): string {
   return category.slice(0, 4).toUpperCase();
 }
 
+function buildClientVaultPathname(rawName: string, lifetime: LifetimeId): string {
+  const safeName =
+    rawName.replace(/[\x00-\x1f\x80-\x9f/?<>\\:*|"]/g, '_').trim().slice(0, 200) ||
+    'unnamed-file';
+  const nowMs = Date.now();
+  const durationMs = LIFETIME_OPTIONS[lifetime].durationMs;
+  const expiresAtMs = durationMs === null ? 0 : nowMs + durationMs;
+  const uniqueId = `${nowMs}-${Math.random().toString(16).slice(2, 12)}`;
+  return `vault/exp_${expiresAtMs}_${lifetime}_${uniqueId}/${safeName}`;
+}
+
 export default function VaultApp({
   initialAuthenticated,
   initialStorageMode,
   initialIsDefaultPassword,
   initialFiles,
+  initialEntitlement,
 }: VaultAppProps) {
-  // Auth state
+  // Auth & Entitlement state
   const [authenticated, setAuthenticated] = useState(initialAuthenticated);
   const [storageMode, setStorageMode] = useState<StorageMode>(initialStorageMode);
   const [isDefaultPassword, setIsDefaultPassword] = useState(initialIsDefaultPassword);
+  const [entitlement, setEntitlement] = useState<ActiveEntitlement>(initialEntitlement);
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  // Theme state
-  const [theme, setTheme] = useState<'light' | 'dark'>('light');
+  // Theme state (lazy client initializer)
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    if (typeof window === 'undefined') return 'light';
+    const saved = localStorage.getItem('vaultdrop-theme');
+    if (saved === 'dark' || saved === 'light') return saved;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  });
 
   // Vault files state
   const [files, setFiles] = useState<StoredFileItem[]>(initialFiles);
   const [loadingFiles, setLoadingFiles] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [upgradeSuccessBanner, setUpgradeSuccessBanner] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.get('upgraded') === '1'
+      ? 'Pass activated! You now have up to 5 TB large-file uploads, extended lifetimes, and ad-free instant downloads.'
+      : null;
+  });
+
+  // Selected upload lifetime (defaults to '7d' — 1 Week Auto-Delete!)
+  const [uploadLifetime, setUploadLifetime] = useState<LifetimeId>('7d');
+  const effectiveLifetime: LifetimeId = canUseLifetime(entitlement, uploadLifetime).allowed
+    ? uploadLifetime
+    : '7d';
 
   // Upload state
   const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
   const abortControllersRef = useRef<Map<string, () => void>>(new Map());
+  const pendingLargeFilesRef = useRef<File[] | null>(null);
   const [isDraggingOverZone, setIsDraggingOverZone] = useState(false);
   const [isDraggingOverWindow, setIsDraggingOverWindow] = useState(false);
   const dragCounterRef = useRef(0);
@@ -110,20 +181,27 @@ export default function VaultApp({
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   const [viewMode, setViewMode] = useState<ViewMode>('table');
 
-  // Selection & Preview modal state
+  // Modals: Preview, Upgrade/Pricing, Download Interstitial, Edit File Lifetime
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [previewFile, setPreviewFile] = useState<StoredFileItem | null>(null);
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
+  const [upgradeModalOpen, setUpgradeModalOpen] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('upgraded') === '1';
+  });
+  const [upgradeReason, setUpgradeReason] = useState<string | null>(null);
+  const [interstitialFiles, setInterstitialFiles] = useState<StoredFileItem[] | null>(null);
+  const [lifetimeEditFile, setLifetimeEditFile] = useState<StoredFileItem | null>(null);
 
-  // Initialize theme from localStorage or system preference
+  // Synchronize external DOM data-theme attribute & clean URL query string
   useEffect(() => {
-    const saved = localStorage.getItem('vaultdrop-theme') as 'light' | 'dark' | null;
-    if (saved === 'dark' || saved === 'light') {
-      setTheme(saved);
-      document.documentElement.setAttribute('data-theme', saved);
-    } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-      setTheme('dark');
-      document.documentElement.setAttribute('data-theme', 'dark');
+    document.documentElement.setAttribute('data-theme', theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('upgraded') || params.has('checkout')) {
+      window.history.replaceState({}, '', window.location.pathname);
     }
   }, []);
 
@@ -131,8 +209,15 @@ export default function VaultApp({
     const next = theme === 'light' ? 'dark' : 'light';
     setTheme(next);
     localStorage.setItem('vaultdrop-theme', next);
-    document.documentElement.setAttribute('data-theme', next);
   };
+
+  const openUpgradeWithReason = useCallback(
+    (reason: string | null = null) => {
+      setUpgradeReason(reason);
+      setUpgradeModalOpen(true);
+    },
+    [setUpgradeReason, setUpgradeModalOpen]
+  );
 
   const fetchFiles = useCallback(async () => {
     setLoadingFiles(true);
@@ -149,12 +234,35 @@ export default function VaultApp({
       }
       setFiles(data.files || []);
       if (data.storageMode) setStorageMode(data.storageMode);
+      if (data.entitlement) setEntitlement(data.entitlement);
     } catch (err) {
       setGlobalError(err instanceof Error ? err.message : 'Error loading files');
     } finally {
       setLoadingFiles(false);
     }
   }, []);
+
+  const triggerDirectDownloads = useCallback((targetFiles: StoredFileItem[]) => {
+    targetFiles.forEach((file, idx) => {
+      setTimeout(() => {
+        const a = document.createElement('a');
+        a.href = `/api/files/download?id=${encodeURIComponent(file.id)}`;
+        a.download = file.name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      }, idx * 240);
+    });
+  }, []);
+
+  const handleRequestDownload = (targetFiles: StoredFileItem[]) => {
+    if (targetFiles.length === 0) return;
+    if (entitlement.adFree) {
+      triggerDirectDownloads(targetFiles);
+    } else {
+      setInterstitialFiles(targetFiles);
+    }
+  };
 
   const handleCancelUpload = (uid: string) => {
     const abortFn = abortControllersRef.current.get(uid);
@@ -171,16 +279,49 @@ export default function VaultApp({
     );
   };
 
-  // Upload handler supporting 500MB+ / multi-GB files via @vercel/blob/client multipart chunking
-  // and streaming binary PUT for local disk mode.
+  // Upload handler enforcing Free (250 MB) vs Paid (5 TB) limits & selected lifetime
   const handleFilesUpload = useCallback(
-    async (incomingFiles: FileList | File[]) => {
+    async (
+      incomingFiles: FileList | File[],
+      overrideEntitlement?: ActiveEntitlement,
+      overrideLifetime?: LifetimeId
+    ) => {
       const fileArray = Array.from(incomingFiles);
       if (fileArray.length === 0) return;
 
+      const activeEnt = overrideEntitlement || entitlement;
+      const activeLifetime = overrideLifetime || effectiveLifetime;
+
+      // 1. Check lifetime entitlement
+      const lifetimePerm = canUseLifetime(activeEnt, activeLifetime);
+      if (!lifetimePerm.allowed) {
+        pendingLargeFilesRef.current = fileArray;
+        openUpgradeWithReason(
+          lifetimePerm.reason ||
+            'Extended file retention requires a Paid Pass or Pro Unlimited.'
+        );
+        return;
+      }
+
+      // 2. Check file size limits (250 MB Free vs 5 TB Paid)
+      const oversized = fileArray.find((f) => f.size > activeEnt.maxFileBytes);
+      if (oversized) {
+        pendingLargeFilesRef.current = fileArray;
+        openUpgradeWithReason(
+          `"${oversized.name}" (${formatBytes(
+            oversized.size
+          )}) exceeds the ${formatBytes(
+            activeEnt.maxFileBytes
+          )} Free Tier limit. Unlock a Large File Pass ($2.99) or Pro Unlimited ($9/mo) to upload files up to 5 TB.`
+        );
+        return;
+      }
+
+      pendingLargeFilesRef.current = null;
       setGlobalError(null);
 
-      const MULTIPART_THRESHOLD = 4 * 1024 * 1024; // 4 MB
+      const MULTIPART_THRESHOLD = 4 * 1024 * 1024;
+      const lifetimeShortLabel = LIFETIME_OPTIONS[activeLifetime].shortLabel;
 
       const newQueueItems: UploadQueueItem[] = fileArray.map((f, idx) => ({
         uid: `${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`,
@@ -189,6 +330,7 @@ export default function VaultApp({
         loadedBytes: 0,
         progress: 0,
         isMultipart: f.size > MULTIPART_THRESHOLD,
+        lifetimeLabel: lifetimeShortLabel,
         status: 'uploading',
       }));
 
@@ -206,17 +348,17 @@ export default function VaultApp({
               abortController.abort()
             );
 
-            const uniquePrefix = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-            const safeName =
-              file.name.replace(/[\x00-\x1f\x80-\x9f/?<>\\:*|"]/g, '_').trim() ||
-              'unnamed-file';
+            const pathname = buildClientVaultPathname(file.name, activeLifetime);
 
-            await vercelClientUpload(`vault/${uniquePrefix}/${safeName}`, file, {
+            await vercelClientUpload(pathname, file, {
               access: 'public',
               handleUploadUrl: '/api/files/client-upload',
-              // Enable 8 MB parallel multipart chunking + automatic part retries for all files > 4 MB (supports up to 5 TB!)
               multipart: useMultipart,
               contentType: file.type || undefined,
+              clientPayload: JSON.stringify({
+                lifetime: activeLifetime,
+                size: file.size,
+              }),
               abortSignal: abortController.signal,
               onUploadProgress: (progressEvent) => {
                 setUploadQueue((prev) =>
@@ -249,7 +391,7 @@ export default function VaultApp({
             );
             await fetchFiles();
           } else {
-            // Local Disk mode: stream raw binary file via PUT /api/files so 500MB+ files never buffer into FormData memory
+            // Local Disk mode: stream raw binary file via PUT /api/files with lifetime & size params
             const uploadedItem = await new Promise<StoredFileItem>((resolve, reject) => {
               const xhr = new XMLHttpRequest();
               abortControllersRef.current.set(queueItem.uid, () => xhr.abort());
@@ -270,6 +412,11 @@ export default function VaultApp({
               xhr.addEventListener('load', () => {
                 try {
                   const response = JSON.parse(xhr.responseText || '{}');
+                  if (xhr.status === 402) {
+                    openUpgradeWithReason(response.error || 'Upgrade required.');
+                    reject(new Error(response.error || 'Upgrade required'));
+                    return;
+                  }
                   if (xhr.status >= 200 && xhr.status < 300 && response.uploaded?.[0]) {
                     resolve(response.uploaded[0]);
                   } else {
@@ -288,9 +435,11 @@ export default function VaultApp({
                 reject(new Error('ABORTED'));
               });
 
-              const putUrl = `/api/files?name=${encodeURIComponent(file.name)}&type=${encodeURIComponent(
+              const putUrl = `/api/files?name=${encodeURIComponent(
+                file.name
+              )}&type=${encodeURIComponent(
                 file.type || 'application/octet-stream'
-              )}`;
+              )}&lifetime=${encodeURIComponent(activeLifetime)}&size=${file.size}`;
               xhr.open('PUT', putUrl);
               xhr.setRequestHeader(
                 'Content-Type',
@@ -322,6 +471,9 @@ export default function VaultApp({
           if (message === 'ABORTED' || (err instanceof Error && err.name === 'AbortError')) {
             continue;
           }
+          if (message.includes('UPGRADE_REQUIRED')) {
+            openUpgradeWithReason(message.replace(/^UPGRADE_REQUIRED:\s*/, ''));
+          }
           setUploadQueue((prev) =>
             prev.map((item) =>
               item.uid === queueItem.uid && item.status !== 'cancelled'
@@ -332,7 +484,7 @@ export default function VaultApp({
         }
       }
     },
-    [storageMode, fetchFiles]
+    [entitlement, effectiveLifetime, storageMode, fetchFiles, openUpgradeWithReason]
   );
 
   // Full-window drag-and-drop and clipboard paste support when authenticated
@@ -423,6 +575,7 @@ export default function VaultApp({
 
       setAuthenticated(true);
       if (data.storageMode) setStorageMode(data.storageMode);
+      if (data.entitlement) setEntitlement(data.entitlement);
       if (typeof data.isDefaultPassword === 'boolean') {
         setIsDefaultPassword(data.isDefaultPassword);
       }
@@ -482,6 +635,18 @@ export default function VaultApp({
     }
   };
 
+  const handleSelectLifetimeOption = (optId: LifetimeId) => {
+    const check = canUseLifetime(entitlement, optId);
+    if (!check.allowed) {
+      openUpgradeWithReason(
+        check.reason ||
+          'Upgrade your pass to keep files online for 30 days, 1 year, or permanently.'
+      );
+      return;
+    }
+    setUploadLifetime(optId);
+  };
+
   // Filtered and sorted files
   const filteredFiles = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -489,7 +654,11 @@ export default function VaultApp({
       if (selectedCategory !== 'all' && file.category !== selectedCategory) {
         return false;
       }
-      if (q && !file.name.toLowerCase().includes(q) && !file.contentType.toLowerCase().includes(q)) {
+      if (
+        q &&
+        !file.name.toLowerCase().includes(q) &&
+        !file.contentType.toLowerCase().includes(q)
+      ) {
         return false;
       }
       return true;
@@ -537,16 +706,7 @@ export default function VaultApp({
 
   const handleBatchDownload = () => {
     const selectedList = files.filter((f) => selectedIds.has(f.id));
-    selectedList.forEach((file, idx) => {
-      setTimeout(() => {
-        const a = document.createElement('a');
-        a.href = `/api/files/download?id=${encodeURIComponent(file.id)}`;
-        a.download = file.name;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-      }, idx * 220);
-    });
+    handleRequestDownload(selectedList);
   };
 
   return (
@@ -565,12 +725,42 @@ export default function VaultApp({
           </div>
 
           <div className="topbar-actions">
+            {/* Tier / Upgrade Button */}
+            {authenticated &&
+              (entitlement.tier === 'paid' ? (
+                <button
+                  type="button"
+                  id="topbar-active-pass-btn"
+                  className="tier-topbar-btn pro"
+                  onClick={() => openUpgradeWithReason(null)}
+                  title="View active pass & copy portable License Key"
+                >
+                  <span className="storage-dot" />
+                  <span>Pro Active · 5 TB + Ad-Free</span>
+                </button>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                  <span className="storage-badge hide-mobile">
+                    Free Tier · 250 MB / 7d Max
+                  </span>
+                  <button
+                    type="button"
+                    id="topbar-upgrade-btn"
+                    className="btn btn-primary"
+                    style={{ padding: '0.42rem 0.85rem', fontSize: '0.8rem' }}
+                    onClick={() => openUpgradeWithReason(null)}
+                  >
+                    Upgrade / Go Pro
+                  </button>
+                </div>
+              ))}
+
             <div
-              className="storage-badge"
+              className="storage-badge hide-mobile"
               title={
                 storageMode === 'vercel-blob'
-                  ? 'Connected to Vercel Blob cloud storage (Multipart 5TB enabled)'
-                  : 'Using Local Disk storage (set BLOB_READ_WRITE_TOKEN in Vercel for Vercel Blob)'
+                  ? 'Connected to Vercel Blob cloud storage'
+                  : 'Using Local Disk storage'
               }
             >
               <span
@@ -619,7 +809,7 @@ export default function VaultApp({
                   <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
                   <path d="M7 11V7a5 5 0 0 1 10 0v4" />
                 </svg>
-                Lock Vault
+                Lock
               </button>
             )}
           </div>
@@ -628,7 +818,7 @@ export default function VaultApp({
 
       {/* Main Content: Either Password Gate OR Authenticated Vault */}
       {!authenticated ? (
-        <main className="auth-wrapper">
+        <main className="auth-wrapper" style={{ flexDirection: 'column', gap: '1.25rem' }}>
           <section className="auth-card" aria-labelledby="auth-heading">
             <div className="auth-card-header">
               <span className="auth-index-label">Protected Access // 01</span>
@@ -723,10 +913,22 @@ export default function VaultApp({
             </form>
 
             <div className="auth-card-footer">
-              <span>Encrypted Cookie Session</span>
-              <span className="mono">7-Day Persistence</span>
+              <span>Free: 250 MB · 7-Day Auto-Delete</span>
+              <span className="mono">Pro: 5 TB · Permanent</span>
             </div>
           </section>
+
+          {/* Login Gate Sponsor Placement (hidden for Pro users) */}
+          <div style={{ width: '100%', maxWidth: '440px' }}>
+            <AdBanner
+              adFree={entitlement.adFree}
+              variant="compact"
+              slotIndex={1}
+              onUpgradeClick={() =>
+                setAuthError('Unlock the vault first to purchase or activate a Pro pass.')
+              }
+            />
+          </div>
         </main>
       ) : (
         <main className="vault-main">
@@ -745,9 +947,23 @@ export default function VaultApp({
                   Drop files anywhere to upload
                 </h2>
                 <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-                  Release your mouse to immediately upload files to the online vault.
+                  Selected lifetime: <strong>{LIFETIME_OPTIONS[effectiveLifetime].label}</strong> · Max
+                  size: <strong>{formatBytes(entitlement.maxFileBytes)}</strong>
                 </p>
               </div>
+            </div>
+          )}
+
+          {upgradeSuccessBanner && (
+            <div className="alert-banner alert-success" role="status">
+              <span>{upgradeSuccessBanner}</span>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => setUpgradeSuccessBanner(null)}
+              >
+                Dismiss
+              </button>
             </div>
           )}
 
@@ -766,7 +982,7 @@ export default function VaultApp({
             }}
           />
 
-          {/* Dropzone Panel */}
+          {/* Dropzone + File Auto-Delete Lifetime Bar */}
           <section
             id="dropzone-panel"
             className={`dropzone-panel ${isDraggingOverZone ? 'active' : ''}`}
@@ -801,8 +1017,21 @@ export default function VaultApp({
                     Drop files here, paste from clipboard, or browse to upload
                   </h1>
                   <p className="dropzone-subtitle">
-                    Supports any file format and size (500 MB+ / multi-GB files automatically use
-                    8 MB parallel multipart chunking with auto-retry).
+                    {entitlement.tier === 'paid'
+                      ? 'Paid Pass Unlocked: Upload up to 5 TB per file with 8 MB parallel multipart chunking.'
+                      : 'Free Tier: Up to 250 MB per file (default 1-week auto-delete). Need 500 MB+ or long-term storage?'}{' '}
+                    {entitlement.tier !== 'paid' && (
+                      <button
+                        type="button"
+                        className="inline-upgrade-link"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openUpgradeWithReason(null);
+                        }}
+                      >
+                        Unlock 5 TB & Permanent Storage →
+                      </button>
+                    )}
                   </p>
                 </div>
               </div>
@@ -822,7 +1051,49 @@ export default function VaultApp({
                 </button>
               </div>
             </div>
+
+            {/* File Auto-Delete Lifetime Selector */}
+            <div
+              className="lifetime-selector-bar"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <span className="lifetime-bar-label">
+                Auto-Delete Lifetime:
+              </span>
+              <div className="lifetime-pills" role="radiogroup" aria-label="File auto-delete lifetime">
+                {ORDERED_LIFETIMES.map((opt) => {
+                  const allowed = canUseLifetime(entitlement, opt.id).allowed;
+                  const active = effectiveLifetime === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      id={`lifetime-opt-${opt.id}`}
+                      className={`lifetime-pill ${active ? 'active' : ''} ${
+                        !allowed ? 'locked' : ''
+                      }`}
+                      onClick={() => handleSelectLifetimeOption(opt.id)}
+                    >
+                      <span>{opt.label}</span>
+                      {!allowed && (
+                        <span className="lock-tag" aria-label="Requires upgrade">
+                          PRO
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </section>
+
+          {/* Ad Placement for Free Tier Users (Automatically Hidden for Paid Users) */}
+          <AdBanner
+            adFree={entitlement.adFree}
+            variant="leaderboard"
+            slotIndex={0}
+            onUpgradeClick={() => openUpgradeWithReason(null)}
+          />
 
           {/* Active / Recent Upload Queue Drawer */}
           {uploadQueue.length > 0 && (
@@ -850,21 +1121,9 @@ export default function VaultApp({
                     <div className="upload-item-top">
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', minWidth: 0 }}>
                         <span className="upload-item-name">{item.name}</span>
+                        <span className="expiry-pill">{item.lifetimeLabel}</span>
                         {item.isMultipart && (
-                          <span
-                            className="mono"
-                            style={{
-                              fontSize: '0.68rem',
-                              padding: '0.1rem 0.4rem',
-                              borderRadius: '4px',
-                              backgroundColor: 'var(--bg-recessed)',
-                              border: '1px solid var(--border-subtle)',
-                              color: 'var(--text-secondary)',
-                              flexShrink: 0,
-                            }}
-                          >
-                            Multipart 8MB Chunks
-                          </span>
+                          <span className="expiry-pill">Multipart 8MB</span>
                         )}
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexShrink: 0 }}>
@@ -1148,8 +1407,8 @@ export default function VaultApp({
                       />
                     </th>
                     <th>File Name</th>
-                    <th className="hide-mobile">Category / MIME</th>
                     <th>Size</th>
+                    <th>Auto-Delete / Lifetime</th>
                     <th className="hide-mobile">Uploaded</th>
                     <th style={{ textAlign: 'right' }}>Actions</th>
                   </tr>
@@ -1158,8 +1417,9 @@ export default function VaultApp({
                   {filteredFiles.map((file) => {
                     const isSelected = selectedIds.has(file.id);
                     const isDeleting = deletingIds.has(file.id);
-                    const downloadUrl = `/api/files/download?id=${encodeURIComponent(file.id)}`;
                     const inlineUrl = `/api/files/download?id=${encodeURIComponent(file.id)}&inline=1`;
+                    const expiryText = formatExpiryLabel(file.expiresAt);
+                    const soon = isExpiringSoon(file.expiresAt);
 
                     return (
                       <tr key={file.id} className={isSelected ? 'selected' : ''}>
@@ -1195,15 +1455,31 @@ export default function VaultApp({
                               >
                                 {file.name}
                               </button>
-                              <span className="file-submeta">{file.category.toUpperCase()}</span>
+                              <span className="file-submeta">
+                                {file.category.toUpperCase()} · {file.contentType.split(';')[0]}
+                              </span>
                             </div>
                           </div>
                         </td>
-                        <td className="hide-mobile mono" style={{ fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
-                          {file.contentType.split(';')[0]}
-                        </td>
                         <td className="mono" style={{ fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
                           {formatBytes(file.size)}
+                        </td>
+                        <td style={{ whiteSpace: 'nowrap' }}>
+                          <button
+                            type="button"
+                            className={`expiry-pill clickable ${
+                              !file.expiresAt
+                                ? 'permanent'
+                                : soon
+                                ? 'warning'
+                                : ''
+                            }`}
+                            onClick={() => setLifetimeEditFile(file)}
+                            title="Click to extend or change auto-delete lifetime"
+                          >
+                            <span>{expiryText}</span>
+                            <span style={{ opacity: 0.7 }}>· Extend</span>
+                          </button>
                         </td>
                         <td className="hide-mobile mono" style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
                           {formatDate(file.uploadedAt)}
@@ -1218,11 +1494,11 @@ export default function VaultApp({
                             >
                               Preview
                             </button>
-                            <a
-                              href={downloadUrl}
-                              download={file.name}
+                            <button
+                              type="button"
                               className="btn btn-secondary"
                               style={{ padding: '0.38rem 0.72rem', fontSize: '0.8rem' }}
+                              onClick={() => handleRequestDownload([file])}
                               title={`Download ${file.name}`}
                             >
                               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
@@ -1231,7 +1507,7 @@ export default function VaultApp({
                                 <line x1="12" y1="15" x2="12" y2="3" />
                               </svg>
                               Download
-                            </a>
+                            </button>
                             <button
                               type="button"
                               className="btn btn-ghost btn-icon"
@@ -1259,8 +1535,9 @@ export default function VaultApp({
               {filteredFiles.map((file) => {
                 const isSelected = selectedIds.has(file.id);
                 const isDeleting = deletingIds.has(file.id);
-                const downloadUrl = `/api/files/download?id=${encodeURIComponent(file.id)}`;
                 const inlineUrl = `/api/files/download?id=${encodeURIComponent(file.id)}&inline=1`;
+                const expiryText = formatExpiryLabel(file.expiresAt);
+                const soon = isExpiringSoon(file.expiresAt);
 
                 return (
                   <div
@@ -1300,25 +1577,33 @@ export default function VaultApp({
 
                       <div className="file-grid-meta">
                         <span>{formatBytes(file.size)}</span>
-                        <span>{formatDate(file.uploadedAt).split(',')[0]}</span>
+                        <button
+                          type="button"
+                          className={`expiry-pill clickable ${
+                            !file.expiresAt ? 'permanent' : soon ? 'warning' : ''
+                          }`}
+                          onClick={() => setLifetimeEditFile(file)}
+                        >
+                          {expiryText}
+                        </button>
                       </div>
 
                       <div className="file-grid-actions">
-                        <a
-                          href={downloadUrl}
-                          download={file.name}
+                        <button
+                          type="button"
                           className="btn btn-primary"
                           style={{ flex: 1, padding: '0.4rem 0.6rem', fontSize: '0.78rem' }}
+                          onClick={() => handleRequestDownload([file])}
                         >
                           Download
-                        </a>
+                        </button>
                         <button
                           type="button"
                           className="btn btn-secondary"
                           style={{ padding: '0.4rem 0.6rem', fontSize: '0.78rem' }}
-                          onClick={() => setPreviewFile(file)}
+                          onClick={() => setLifetimeEditFile(file)}
                         >
-                          Preview
+                          Extend
                         </button>
                         <button
                           type="button"
@@ -1348,8 +1633,71 @@ export default function VaultApp({
         file={previewFile}
         onClose={() => setPreviewFile(null)}
         onDelete={(id) => handleDeleteFiles([id])}
+        onRequestDownload={(f) => handleRequestDownload([f])}
+        onEditLifetime={(f) => {
+          setPreviewFile(null);
+          setLifetimeEditFile(f);
+        }}
         formatBytes={formatBytes}
         formatDate={formatDate}
+        formatExpiryLabel={formatExpiryLabel}
+      />
+
+      {/* 5-Second Sponsored Download Interstitial (Free Tier Only) */}
+      <DownloadInterstitialModal
+        queuedFiles={interstitialFiles}
+        onClose={() => setInterstitialFiles(null)}
+        onCompleteDownload={(dlFiles) => {
+          triggerDirectDownloads(dlFiles);
+          setInterstitialFiles(null);
+        }}
+        onSkipWithUpgrade={() => {
+          setInterstitialFiles(null);
+          openUpgradeWithReason(
+            'Upgrade to skip the 5-second sponsored download wait and remove all ads.'
+          );
+        }}
+        formatBytes={formatBytes}
+      />
+
+      {/* Change / Extend File Lifetime Modal */}
+      <FileLifetimeModal
+        file={lifetimeEditFile}
+        entitlement={entitlement}
+        onClose={() => setLifetimeEditFile(null)}
+        onUpdated={(updatedFile) => {
+          setFiles((prev) =>
+            prev.map((f) =>
+              f.name === updatedFile.name && f.uploadedAt === updatedFile.uploadedAt
+                ? updatedFile
+                : f.id === lifetimeEditFile?.id
+                ? updatedFile
+                : f
+            )
+          );
+        }}
+        onRequireUpgrade={(reason) => openUpgradeWithReason(reason)}
+        formatExpiryLabel={formatExpiryLabel}
+      />
+
+      {/* Upgrade / Pricing / License Key Modal */}
+      <UpgradeModal
+        open={upgradeModalOpen}
+        reasonBanner={upgradeReason}
+        entitlement={entitlement}
+        onClose={() => {
+          setUpgradeModalOpen(false);
+          setUpgradeReason(null);
+        }}
+        onEntitlementUpdated={(nextEnt) => {
+          setEntitlement(nextEnt);
+          // If the user had queued large files waiting on upgrade, start uploading them automatically!
+          if (nextEnt.tier === 'paid' && pendingLargeFilesRef.current) {
+            const queued = pendingLargeFilesRef.current;
+            pendingLargeFilesRef.current = null;
+            handleFilesUpload(queued, nextEnt);
+          }
+        }}
       />
     </div>
   );

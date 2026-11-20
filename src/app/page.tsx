@@ -1,11 +1,15 @@
 import { isAuthenticated, isUsingDefaultPassword } from '@/lib/auth';
 import { getStorageMode, listStoredFiles, type StoredFileItem } from '@/lib/storage';
+import { getActiveEntitlement } from '@/lib/monetization-server';
 import VaultApp from '@/components/VaultApp';
 
 export const dynamic = 'force-dynamic';
 
 export default async function HomePage() {
-  const authenticated = await isAuthenticated();
+  const [authenticated, entitlement] = await Promise.all([
+    isAuthenticated(),
+    getActiveEntitlement(),
+  ]);
   const storageMode = getStorageMode();
   const isDefaultPassword = isUsingDefaultPassword();
 
@@ -24,6 +28,7 @@ export default async function HomePage() {
       initialStorageMode={storageMode}
       initialIsDefaultPassword={isDefaultPassword}
       initialFiles={initialFiles}
+      initialEntitlement={entitlement}
     />
   );
 }

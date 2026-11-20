@@ -7,26 +7,35 @@ interface FilePreviewModalProps {
   file: StoredFileItem | null;
   onClose: () => void;
   onDelete: (id: string) => void;
+  onRequestDownload: (file: StoredFileItem) => void;
+  onEditLifetime: (file: StoredFileItem) => void;
   formatBytes: (bytes: number) => string;
   formatDate: (iso: string) => string;
+  formatExpiryLabel: (expiresAt: string | null) => string;
 }
 
 export default function FilePreviewModal({
   file,
   onClose,
   onDelete,
+  onRequestDownload,
+  onEditLifetime,
   formatBytes,
   formatDate,
+  formatExpiryLabel,
 }: FilePreviewModalProps) {
-  const [textContent, setTextContent] = useState<string | null>(null);
-  const [loadingText, setLoadingText] = useState(false);
+  const [loadedPreview, setLoadedPreview] = useState<{
+    fileId: string;
+    content: string;
+  } | null>(null);
   const [copiedText, setCopiedText] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
 
-  const isTextPreviewable =
+  const isTextPreviewable = Boolean(
     file &&
-    (file.category === 'text' || file.category === 'code') &&
-    file.size <= 512 * 1024;
+      (file.category === 'text' || file.category === 'code') &&
+      file.size <= 512 * 1024
+  );
 
   useEffect(() => {
     if (!file) return;
@@ -40,28 +49,27 @@ export default function FilePreviewModal({
 
   useEffect(() => {
     if (!file || !isTextPreviewable) {
-      setTextContent(null);
-      setLoadingText(false);
       return;
     }
 
+    const currentFileId = file.id;
     let cancelled = false;
-    setLoadingText(true);
-    fetch(`/api/files/download?id=${encodeURIComponent(file.id)}&inline=1&proxy=1`)
+    fetch(`/api/files/download?id=${encodeURIComponent(currentFileId)}&inline=1&proxy=1`)
       .then((res) => {
         if (!res.ok) throw new Error('Failed to load text preview');
         return res.text();
       })
       .then((txt) => {
         if (!cancelled) {
-          setTextContent(txt);
-          setLoadingText(false);
+          setLoadedPreview({ fileId: currentFileId, content: txt });
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setTextContent('Unable to load text preview.');
-          setLoadingText(false);
+          setLoadedPreview({
+            fileId: currentFileId,
+            content: 'Unable to load text preview.',
+          });
         }
       });
 
@@ -71,6 +79,12 @@ export default function FilePreviewModal({
   }, [file, isTextPreviewable]);
 
   if (!file) return null;
+
+  const textContent =
+    isTextPreviewable && loadedPreview?.fileId === file.id
+      ? loadedPreview.content
+      : null;
+  const loadingText = isTextPreviewable && textContent === null;
 
   const inlineUrl = `/api/files/download?id=${encodeURIComponent(file.id)}&inline=1`;
   const downloadUrl = `/api/files/download?id=${encodeURIComponent(file.id)}`;
@@ -110,10 +124,18 @@ export default function FilePreviewModal({
             </div>
             <div className="modal-subtitle">
               {formatBytes(file.size)} · {file.contentType} · Uploaded{' '}
-              {formatDate(file.uploadedAt)}
+              {formatDate(file.uploadedAt)} · {formatExpiryLabel(file.expiresAt)}
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+            <button
+              type="button"
+              id="preview-extend-lifetime-btn"
+              className="btn btn-secondary"
+              onClick={() => onEditLifetime(file)}
+            >
+              Extend Lifetime
+            </button>
             {isTextPreviewable && textContent !== null && (
               <button
                 type="button"
@@ -204,14 +226,14 @@ export default function FilePreviewModal({
                   Direct in-browser preview is not available for this format ({file.contentType}).
                   Download the file below to open it locally.
                 </p>
-                <a
-                  href={downloadUrl}
-                  download={file.name}
+                <button
+                  type="button"
                   className="btn btn-primary"
                   id="preview-center-download-btn"
+                  onClick={() => onRequestDownload(file)}
                 >
                   Download {file.name} ({formatBytes(file.size)})
-                </a>
+                </button>
               </div>
             )}
         </div>
@@ -249,11 +271,11 @@ export default function FilePreviewModal({
             >
               Open Raw
             </a>
-            <a
-              href={downloadUrl}
-              download={file.name}
+            <button
+              type="button"
               className="btn btn-primary"
               id="preview-download-btn"
+              onClick={() => onRequestDownload(file)}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
@@ -261,7 +283,7 @@ export default function FilePreviewModal({
                 <line x1="12" y1="15" x2="12" y2="3" />
               </svg>
               Download File
-            </a>
+            </button>
           </div>
         </div>
       </div>

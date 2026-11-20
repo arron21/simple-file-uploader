@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import Script from 'next/script';
 import { Inter, JetBrains_Mono } from 'next/font/google';
 import './globals.css';
 
@@ -14,10 +15,19 @@ const jetbrainsMono = JetBrains_Mono({
   display: 'swap',
 });
 
+const adsenseClientId = process.env.NEXT_PUBLIC_ADSENSE_CLIENT_ID?.trim();
+
 export const metadata: Metadata = {
   title: 'VaultDrop — Password-Protected Online File Vault',
   description:
-    'Fast, password-protected file uploader and online vault. Log in with the shared password to upload, preview, search, and download files from anywhere.',
+    'Fast, password-protected file uploader and online vault. Upload up to 5 TB, choose custom auto-delete lifetimes or permanent archival storage, and download from anywhere.',
+  ...(adsenseClientId
+    ? {
+        other: {
+          'google-adsense-account': adsenseClientId,
+        },
+      }
+    : {}),
 };
 
 export default function RootLayout({
@@ -28,6 +38,15 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={`${inter.variable} ${jetbrainsMono.variable}`}>
+        {adsenseClientId && (
+          <Script
+            id="google-adsense-script"
+            async
+            strategy="afterInteractive"
+            src={`https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${adsenseClientId}`}
+            crossOrigin="anonymous"
+          />
+        )}
         {children}
       </body>
     </html>

@@ -62,3 +62,6 @@ next-env.d.ts
 .ssh/
 .vscode*/
 upload/
+arron21/
+.env*
+!.env.example

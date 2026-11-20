@@ -1,56 +1,27 @@
-# VaultDrop — Password-Protected Online File Uploader & Vault
+# VaultDrop — Monetized Password-Protected Online File Vault
 
-A fast, password-protected file uploader and online file vault built with **Next.js (App Router + TypeScript)**, **Vanilla CSS**, and **Vercel Blob (`@vercel/blob`)** with an automatic **Local Disk Fallback** for zero-config local development.
-
-Anyone with the shared password can log in, immediately drag-and-drop or paste files to upload them online, preview files in the browser, and download them from anywhere.
+A fast, password-protected file uploader and online file vault built with **Next.js (App Router + TypeScript)**, **Vanilla CSS**, **Vercel Blob (`@vercel/blob`)**, **Stripe Checkout**, and **Google AdSense + Direct Sponsorships**.
 
 ---
 
-## Features
+## Monetization & Retention Architecture
 
-- **Single Shared Password Gate**: Stateless `HMAC-SHA256` signed `httpOnly` cookie session (`vault_session`). Changing `APP_PASSWORD` immediately invalidates all existing sessions.
-- **Dual-Mode Storage Engine (`src/lib/storage.ts`)**:
-  - **Vercel Blob (`@vercel/blob`)**: Automatically active whenever `BLOB_READ_WRITE_TOKEN` is present. Supports both standard multipart uploads and direct client-to-blob uploads (`@vercel/blob/client`) for large files.
-  - **Local Disk Fallback (`.local-vault/`)**: Automatically active in local development when `BLOB_READ_WRITE_TOKEN` is not set.
-- **Multi-File Drag-and-Drop & Clipboard Paste**:
-  - Drop files onto the upload zone or anywhere on the window.
-  - Paste screenshots or copied files directly with `Ctrl+V` / `Cmd+V`.
-  - Real-time per-file progress bars.
-- **Authenticated Downloads & In-Browser Previews**:
-  - Every file list, upload, preview, and download request is protected by the session cookie.
-  - Built-in preview modal for images, PDFs, video, audio, and code/text files.
-  - Search by filename/MIME type, filter by file category, sort by date/name/size, and switch between **Archival Table View** and **Visual Grid View**.
+1. **Tiered File Size & Auto-Delete Lifetimes**:
+   - **Free Ad-Supported Tier**:
+     - Upload files up to **250 MB per file**.
+     - Files automatically delete after **1 Week (7 Days)** by default (or **24 Hours** if chosen).
+     - Displays Google AdSense / Direct Sponsor banners and a **5-second Sponsored Download Interstitial** before downloads.
+   - **Paid Passes & Pro Unlimited**:
+     - **$2.99 Large File & 1-Year Pass** *(72-hour pass)*: Upload files over 250 MB (up to **5 TB** via 8 MB multipart chunking), unlock **30-Day** & **1-Year** retention, extend existing files, and enjoy ad-free 0-second downloads.
+     - **$6.99 Permanent Archival Pass** *(7-day pass)*: Everything above plus **Permanent (Never Auto-Delete)** file storage.
+     - **$9/month VaultDrop Pro Unlimited**: Full monthly membership with **5 TB** uploads, **Permanent** storage, **100% Ad-Free** vault, and a **Portable License Key (`VD1...`)** that works across all your devices.
 
----
+2. **Triple-Layer Auto-Deletion Engine**:
+   - **Native Vercel Blob `ttlDays`**: Automatically sets S3/Blob object expiration (`1`, `7`, `30`, or `365` days; omitted for `Permanent`).
+   - **Read & Download Gate**: Expired files are immediately excluded from `/api/files`, rejected with `410 Gone` on `/api/files/download`, and purged asynchronously.
+   - **Daily Vercel Cron (`/api/cron/cleanup`)**: Configured in `vercel.json` (`0 3 * * *`) to sweep and purge expired files automatically.
 
-## Deploying to Vercel
-
-1. **Import Repository into Vercel**:
-   - Push this repository to GitHub and import it at [vercel.com/new](https://vercel.com/new).
-2. **Connect Vercel Blob Storage**:
-   - In your Vercel project dashboard, go to the **Storage** tab → **Create Database / Store** → select **Blob** (`Vercel Blob`).
-   - Connect the Blob store to your project. Vercel will automatically inject the `BLOB_READ_WRITE_TOKEN` environment variable into your environments.
-3. **Set Your Password**:
-   - In your Vercel project dashboard, go to **Settings** → **Environment Variables**.
-   - Add `APP_PASSWORD` with your desired shared password (e.g. `my-secret-password`).
-   - *(Optional)* Add `SESSION_SECRET` with a random string for signing cookies.
-4. **Redeploy**:
-   - Trigger a deployment (or push a commit). Your password-protected online file vault is live!
-
----
-
-## Local Development
-
-```bash
-# 1. Install dependencies
-npm install
-
-# 2. (Optional) Configure custom password in .env.local
-cp .env.example .env.local
-# Edit APP_PASSWORD in .env.local (defaults to "vault2026" if unset)
-
-# 3. Start the development server
-npm run dev
-```
-
-Open `http://localhost:3000`, unlock with your password (default `vault2026`), and start uploading and downloading files immediately.
+3. **Going Live with Real Payments & Ads on Vercel**:
+   - **Accept Real Payments (Stripe)**: Add `STRIPE_SECRET_KEY` (`sk_live_...`) in **Vercel → Settings → Environment Variables**. No manual Stripe Product/Price setup is required—Checkout Sessions are created dynamically! (Until `STRIPE_SECRET_KEY` is added, an Interactive Sandbox Checkout is active for testing, plus `PRO_PROMO_CODE` support).
+   - **Run Google AdSense Ads**: Add `NEXT_PUBLIC_ADSENSE_CLIENT_ID` (`ca-pub-...`), `NEXT_PUBLIC_ADSENSE_BANNER_SLOT`, and `NEXT_PUBLIC_ADSENSE_INTERSTITIAL_SLOT` in Vercel. `/ads.txt` is automatically generated and served at `https://your-domain/ads.txt`!
+   - **Sell Direct Sponsorships**: Set `NEXT_PUBLIC_SPONSOR_INQUIRY_URL` (e.g., a Stripe Payment Link, Cal.com link, or `mailto:`) for the **"Advertise Here"** link on native ad units.
